@@ -1378,6 +1378,10 @@ export function SuperAgentWorkspace({
     const displayTitle = localizedGameTitle(game, locale);
     const patch = toGameArtifact(game, displayTitle);
     const artifactId = patch.id || `game:${game.id}`;
+    if (game.external?.embeddable && viewerOpen && activeTabId === artifactId
+      && (activeChat?.artifacts ?? previewArtifacts).some(item => item.id === artifactId && item.url === patch.url)) {
+      return artifactId;
+    }
     const now = Date.now();
     const fullArtifact: SuperAgentArtifact = {
       id: artifactId,
@@ -1415,7 +1419,7 @@ export function SuperAgentWorkspace({
     setActiveTabId(fullArtifact.id);
     setViewerOpen(true);
     return fullArtifact.id;
-  }, [activeChat, applyChatSnapshot, locale, showToast, t]);
+  }, [activeChat, activeTabId, applyChatSnapshot, locale, previewArtifacts, showToast, t, viewerOpen]);
 
   const handleDeployGame = useCallback(async (game: GameCard) => {
     const openedArtifactId = await handlePlayGame(game);

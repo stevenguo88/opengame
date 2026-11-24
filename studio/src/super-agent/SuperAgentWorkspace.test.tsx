@@ -3134,6 +3134,24 @@ it('auto-enters Game mode when opened from Game Studio, plays games in Artifact 
   await act(async () => listPlayBtn.click());
   await flush();
   expect(container.querySelector('.om-sa-viewer')).toBeTruthy();
+
+  const evensong = communityGames.find(game => game.id === 'community-evensong')!;
+  const evensongPlay = container.querySelector<HTMLButtonElement>(`button[aria-label="Try game: ${evensong.title}"]`)!;
+  const origin = new URL(evensong.external!.url).origin;
+  await act(async () => evensongPlay.focus());
+  expect(document.head.querySelector(`link[rel="preconnect"][href="${origin}"]`)).toBeTruthy();
+
+  await act(async () => evensongPlay.click());
+  const gameFrame = () => container.querySelector<HTMLIFrameElement>(`iframe[title="${evensong.title}"]`);
+  const originalFrame = gameFrame();
+  expect(originalFrame?.getAttribute('src')).toBe(evensong.external!.url);
+
+  await act(async () => evensongPlay.click());
+  expect(gameFrame()).toBe(originalFrame);
+
+  const reload = container.querySelector<HTMLButtonElement>('.om-sa-viewer button[aria-label="Reload"]')!;
+  await act(async () => reload.click());
+  expect(gameFrame()).not.toBe(originalFrame);
 });
 
 it('consumes Cloud deploy requests across viewer remounts and aborts deploy when opening a game fails', async () => {

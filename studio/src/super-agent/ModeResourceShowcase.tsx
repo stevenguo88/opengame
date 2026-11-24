@@ -1,6 +1,7 @@
 import { Button } from 'open-design-ui/button';
 import { IconButton } from 'open-design-ui/icon-button';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { preconnect } from 'react-dom';
 import { blackFridayTemplates } from '../../../shared/black-friday-collection';
 import type { GalleryTemplate } from '../../../shared/catalog';
 import { designScenarios, isDesignScenario } from '../../../shared/design-project';
@@ -51,6 +52,12 @@ import {
 } from './ModeComposerControls';
 import { resourceDisplaySubtitle, resourceDisplayTitle, resourceIcon, resourceKey, type ResourceCategoryTab } from './ResourcePickerDialog';
 import { fetchWorkspaceResources } from './superAgentClient';
+
+function preconnectGame(game: GameCard) {
+  if (!game.external?.embeddable) return;
+  const url = new URL(game.external.url);
+  if (url.protocol === 'https:') preconnect(url.origin);
+}
 
 export type SuperAgentCreationModeId = 'coding' | 'design' | 'research' | 'visualization' | 'game' | 'website' | 'motion' | 'deck' | 'document' | 'image' | 'media' | 'audio';
 
@@ -1555,6 +1562,8 @@ export function ModeResourceShowcase({
                           data-playing={isPlaying || undefined}
                           title={t('Try game: {title}', { title })}
                           aria-label={t('Try game: {title}', { title })}
+                          onPointerEnter={() => preconnectGame(game)}
+                          onFocus={() => preconnectGame(game)}
                           onClick={() => onPlayGame(game)}
                         >
                           <RemixIcon name="play-fill" size={12} />
@@ -2083,6 +2092,8 @@ export function ModeResourceShowcase({
                             data-playing={isPlaying || undefined}
                             title={t('Try game: {title}', { title })}
                             aria-label={t('Try game: {title}', { title })}
+                            onPointerEnter={() => preconnectGame(game)}
+                            onFocus={() => preconnectGame(game)}
                             onClick={() => onPlayGame(game)}
                           >
                             <RemixIcon name="play-fill" size={12} />
