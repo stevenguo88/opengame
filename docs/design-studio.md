@@ -32,7 +32,7 @@ Design Studio projects are stored independently of Motion Studio's HyperFrames c
   design.lock            # cross-process write lock
 ```
 
-Every write verifies `expectedRevision` (SHA-256 of sorted project files) and appends a new immutable `vN` version. Restoring `v3` while on `v5` writes `v3`'s bytes as `v6` and retains `v4` and `v5`.
+Every content write verifies `expectedRevision` (SHA-256 of sorted project files) and appends a new immutable `vN` version. In Version history, **Preview** opens a saved snapshot for inspection. **Make current version** switches the project files, entry point and current-version pointer to the selected version. Selecting `v3` while on `v5` makes `v3` current, keeps `v4` and `v5` available, and leaves `v6` for the next content write.
 
 ## MCP tools & annotation loop
 
