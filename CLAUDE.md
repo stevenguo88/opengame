@@ -48,6 +48,9 @@ Follow [the shared UI rules](AGENTS.md#ui-design-system-and-interaction-feedback
 - **Scalable selectors, verified icons, and immersive inline editing:** Use `Select` instead of wrapping tabs for growing lists (e.g., Agents/models); verify every icon name in `packages/design-system/react/RemixIcons.tsx`; separate creation actions from item lists with explicit section headings; keep empty views concise with secondary controls tucked behind Popovers; keep inline title editing transparent without box backgrounds or `✓`/`×` chrome (`Enter`/blur commits, `Escape` cancels); close Popovers on navigation; and reserve slow media with shared `Skeleton` geometry.
 - **Floating Toasts and live verification:** Use `useToast` and `StudioToastViewport` on the floating feedback layer (including inside native dialogs)—never insert transient notices into document flow. Verify opened Popovers/menus, control-height alignment, hover/active geometry, light/dark themes, and narrow + wide viewports in the browser.
 
+- **Stable file-list alignment.** Keep file names, sizes, and trailing actions in separate columns. Preserve the size and action column positions when file names truncate. Follow the [UI craft checklist](docs/design-system.md#ui-craft-and-anti-patterns-checklist).
+- **Region annotation previews.** Show the annotated page and surrounding context in the comment card's preview area with the selection overlaid at its original proportions. Follow the [UI craft checklist](docs/design-system.md#ui-craft-and-anti-patterns-checklist).
+
 Whenever the user flags a recurring UI or styling polish issue, fix it and distill the generalizable constraint into `CLAUDE.md`, [AGENTS.md](AGENTS.md#ui-design-system-and-interaction-feedback), and [docs/design-system.md](docs/design-system.md#ui-craft-and-anti-patterns-checklist) (citing the design-system rules) so subsequent generated styles automatically follow it.
 
 ## Workflows and guided UX

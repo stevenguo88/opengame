@@ -827,11 +827,14 @@ export async function handler(req: IncomingMessage, res: ServerResponse, store =
     if (motionRequest && url.pathname.startsWith('/api/super-agent')) {
       const superAgent = superAgentConversations(store, context.tracking);
       if (url.pathname === '/api/super-agent/resources' && req.method === 'GET') {
+        const modality = url.searchParams.get('modality');
         return json(res, 200, await collectWorkspaceResources(store.workspaceStore ?? store, {
           kind: url.searchParams.get('kind') ?? undefined,
           query: url.searchParams.get('query') ?? undefined,
           limit: url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : undefined,
           locale: url.searchParams.get('locale') ?? undefined,
+          modality: modality === 'image' || modality === 'video' || modality === 'audio' ? modality : undefined,
+          offset: url.searchParams.has('offset') ? Number(url.searchParams.get('offset')) : undefined,
         }));
       }
       if (url.pathname === '/api/super-agent/uploads' && req.method === 'POST') {

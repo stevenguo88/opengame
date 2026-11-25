@@ -12,6 +12,7 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import { constants } from 'node:fs';
 import { promisify } from 'node:util';
+import type { Browser, Page } from 'puppeteer-core';
 import { atomicJson, jsonFile } from './phase1-versions.ts';
 import { withProcessLock } from './shared/process-lock.ts';
 import { readProjectZip } from './shared/project-zip.ts';
@@ -20,6 +21,7 @@ import { zip } from './scripts/zip.mjs';
 import { browserExecutable } from './browser.ts';
 import { validateReviewAnnotation } from './shared/review-comments.ts';
 import { injectPreviewBridgeHtml, isValidPreviewBridgeToken } from './shared/preview-bridge.ts';
+import { DESIGN_DECK_INACTIVE_ATTRIBUTE, DESIGN_DECK_ISOLATION_CSS, DESIGN_DECK_SLIDE_SELECTOR } from './shared/design-deck-bridge.ts';
 import { designCatalog } from './shared/design-catalog.ts';
 import { designDeployFor } from './gateway/design-deploy.ts';
 import {
@@ -36,6 +38,10 @@ const MAX_WRITE_BYTES = 8 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 100 * 1024 * 1024;
 const MAX_IMPORT_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_COMMENTS = 2000;
+const MAX_COMMENT_PREVIEW_CACHE = 48;
+const MAX_PENDING_COMMENT_PREVIEWS = 24;
+const MAX_COMMENT_PREVIEW_DIMENSION = 960;
+const MAX_COMMENT_SCROLL_CONTAINERS = 24;
 const READ_LIMIT_DEFAULT = 200_000;
 const IGNORED_DIRS = new Set(['node_modules', '.git', '__MACOSX', 'dist', 'build', '.next']);
 
@@ -121,6 +127,7 @@ type StoredProject = Omit<DesignProject, 'revision' | 'versionId' | 'versionLabe
 type ProjectCatalogFile = { schemaVersion: 1; projects: StoredProject[] };
 type VersionFile = { schemaVersion: 1; currentVersionId: string | null; versions: DesignVersion[] };
 type CommentFile = { schemaVersion: 1; comments: DesignComment[] };
+type CommentPreview = { image: Buffer; slideIndex?: number };
 type RequestReceipt = { inputHash: string; result: unknown };
 
 const sha256 = (data: string | Buffer) => createHash('sha256').update(data).digest('hex');
@@ -181,6 +188,47 @@ function isTextFile(filePath: string) {
 function computeRevision(files: { path: string; size: number; sha256: string }[]) {
   const sorted = [...files].sort((a, b) => a.path.localeCompare(b.path)).map(f => ({ path: f.path, size: f.size, sha256: f.sha256 }));
   return sha256(JSON.stringify(sorted));
+}
+
+function commentPreviewViewport(anchor: DesignCommentAnchor) {
+  const viewport = anchor.annotation ?? anchor.viewport;
+  if (![viewport.width, viewport.height].every(Number.isFinite)) return null;
+  const width = Math.round(viewport.width);
+  const height = Math.round(viewport.height);
+  if (width < 1 || height < 1 || width > 4096 || height > 4096) return null;
+  if (anchor.annotation) {
+    const start = anchor.annotation.marks[0]?.points[0];
+    const point = start && { x: Math.min(width - 1, start.x * width), y: Math.min(height - 1, start.y * height) };
+    return { width, height, point };
+  }
+  const box = anchor.region ?? anchor.element?.box;
+  if (!box || ![box.x, box.y, box.width, box.height].every(Number.isFinite)
+    || box.width <= 0 || box.height <= 0 || box.x >= width || box.y >= height
+    || box.x + box.width <= 0 || box.y + box.height <= 0) return null;
+  const point = {
+    x: (Math.max(0, box.x) + Math.min(width, box.x + box.width)) / 2,
+    y: (Math.max(0, box.y) + Math.min(height, box.y + box.height)) / 2,
+  };
+  return { width, height, point };
+}
+
+function deckCommentElement(anchor: DesignCommentAnchor) {
+  const element = anchor.element;
+  if (anchor.slideIndex === undefined || typeof element?.text !== 'string' || !element.text.trim()
+    || typeof element.selector !== 'string' || !element.selector
+    || typeof element.tagName !== 'string' || typeof element.htmlHint !== 'string') return null;
+  const html = element.htmlHint.replace(/\s+/g, ' ').trim();
+  const complete = html.match(/^<([a-z][\w-]*)\b[^>]*>[\s\S]*<\/\1>$/i);
+  return complete?.[1].toLowerCase() === element.tagName.toLowerCase() ? { element, html } : null;
+}
+
+async function showSnapshotSlide(page: Page, slideIndex: number) {
+  await page.evaluate(index => {
+    window.postMessage({ type: 'od:slide', action: 'go', index }, '*');
+    const nodes = Array.from(document.querySelectorAll('.slide, [data-screen-label], .deck-slide, .ppt-slide, .slide-frame'));
+    if (nodes.length > 1) nodes.forEach((n, idx) => n.classList.toggle('active', idx === index));
+  }, slideIndex);
+  await new Promise(resolve => setTimeout(resolve, 120));
 }
 
 function starterFiles(scenario: DesignScenarioId, title: string, hasTokensCss: boolean): Record<string, string> {
@@ -588,6 +636,11 @@ export class DesignProjects {
   private readonly requestsDir: string;
   private readonly catalogPath: string;
   private readonly lockPath: string;
+  private readonly commentPreviews = new Map<string, CommentPreview>();
+  private readonly pendingCommentPreviews = new Map<string, Promise<CommentPreview>>();
+  private commentPreviewQueue = Promise.resolve();
+  private commentPreviewBrowser?: Promise<Browser>;
+  private commentPreviewIdleTimer?: ReturnType<typeof setTimeout>;
 
   constructor(dataDirectory: string) {
     this.root = path.join(path.resolve(dataDirectory), 'design');
@@ -683,7 +736,7 @@ export class DesignProjects {
     return html ?? null;
   }
 
-  private async appendVersion(id: string, files: DesignFile[], opts: { source: DesignVersion['source']; summary?: string | null; prompt?: string | null; restoredFrom?: string | null; entry?: string }): Promise<DesignVersion> {
+  private async appendVersion(id: string, files: DesignFile[], opts: { source: DesignVersion['source']; summary?: string | null; prompt?: string | null; entry?: string }): Promise<DesignVersion> {
     const dir = this.projectDir(id);
     await this.retainBlobs(dir, files);
     const vf = await this.readVersionFile(id);
@@ -696,7 +749,7 @@ export class DesignProjects {
       source: opts.source,
       summary: opts.summary?.trim() || null,
       prompt: opts.prompt?.trim() || null,
-      restoredFrom: opts.restoredFrom ?? null,
+      restoredFrom: null,
       ...(opts.entry ? { entry: opts.entry } : {}),
       files: files.map(f => ({ path: f.path, sha256: f.sha256, size: f.size })),
     };
@@ -1125,9 +1178,9 @@ export class DesignProjects {
     return { versions, currentVersionId: vf.currentVersionId, nextCursor: start + limit < reversed.length ? String(start + limit) : null };
   }
 
-  async restoreVersion(id: string, versionId: string, input: { requestId: string; expectedRevision: string }, origin = ''): Promise<{ project: DesignProjectDetail; version: DesignVersion }> {
+  async restoreVersion(id: string, versionId: string, input: { requestId: string; expectedRevision: string }, origin = ''): Promise<{ project: DesignProjectDetail; version: DesignVersion; changed: boolean }> {
     const pid = validateId(id);
-    return this.lock(() => this.idempotent(`restore-ver:${pid}:${versionId}`, input.requestId, { versionId, expectedRevision: input.expectedRevision }, async () => {
+    const result = await this.lock(() => this.idempotent(`restore-ver:${pid}:${versionId}`, input.requestId, { versionId, expectedRevision: input.expectedRevision }, async () => {
       const catalog = await this.readCatalog();
       const stored = catalog.projects.find(p => p.id === pid && !p.trashedAt);
       if (!stored) throw new DesignError('NOT_FOUND', `Design project ${pid} not found`);
@@ -1140,36 +1193,38 @@ export class DesignProjects {
       const vf = await this.readVersionFile(pid);
       const target = vf.versions.find(v => v.id === versionId);
       if (!target) throw new DesignError('NOT_FOUND', `Version ${versionId} not found`);
-      // Verify every historical blob exists and snapshot has a valid entry before mutating disk.
       const snapshotPaths = target.files.map(f => cleanDesignPath(f.path));
       const restoredEntry = this.resolveEntryPath(target.entry ?? stored.entry, snapshotPaths) ?? snapshotPaths[0] ?? null;
       if (!restoredEntry) {
         throw new DesignError('INVALID_ARGUMENT', `Snapshot ${target.label} contains no files to restore`);
       }
-      for (const file of target.files) {
-        if (!existsSync(path.join(this.blobsDir, file.sha256))) {
-          throw new DesignError('UNSUPPORTED', `Historical blob missing for ${file.path} in ${target.label}`);
+      const filesChanged = computeRevision(target.files) !== currentRevision;
+      const changed = filesChanged || restoredEntry !== stored.entry || vf.currentVersionId !== target.id;
+      if (!changed) return { project: await this.hydrate(stored, origin), version: target, changed };
+
+      if (filesChanged) {
+        // Verify every historical blob exists before replacing the files.
+        for (const file of target.files) {
+          if (!existsSync(path.join(this.blobsDir, file.sha256))) {
+            throw new DesignError('UNSUPPORTED', `Historical blob missing for ${file.path} in ${target.label}`);
+          }
         }
-      }
-      // Replace project files with snapshot bytes.
-      for (const existing of currentFiles) await rm(path.join(dir, existing.path), { force: true });
-      for (const file of target.files) {
-        const dest = path.join(dir, cleanDesignPath(file.path));
-        await mkdir(path.dirname(dest), { recursive: true });
-        await copyFile(path.join(this.blobsDir, file.sha256), dest);
+        for (const existing of currentFiles) await rm(path.join(dir, existing.path), { force: true });
+        for (const [index, file] of target.files.entries()) {
+          const dest = path.join(dir, snapshotPaths[index]);
+          await mkdir(path.dirname(dest), { recursive: true });
+          await copyFile(path.join(this.blobsDir, file.sha256), dest);
+        }
       }
       stored.entry = restoredEntry;
       stored.updatedAt = Date.now();
       await this.saveCatalog(catalog);
-      const restoredFiles = await this.scanFiles(dir);
-      const version = await this.appendVersion(pid, restoredFiles, {
-        source: 'restore',
-        summary: `Restored from ${target.label}`,
-        restoredFrom: target.id,
-        entry: restoredEntry,
-      });
-      return { project: await this.hydrate(stored, origin), version };
+      vf.currentVersionId = target.id;
+      await atomicJson(this.versionPath(pid), vf);
+      return { project: await this.hydrate(stored, origin), version: target, changed };
     }));
+    // Older receipts without a change flag record a completed restore.
+    return { ...result, changed: result.changed ?? true };
   }
 
   async listComments(id: string): Promise<{ comments: DesignComment[]; sourceRevision: string }> {
@@ -1193,6 +1248,21 @@ export class DesignProjects {
       if (!detail.files.some(f => f.path === filePath)) throw new DesignError('INVALID_ARGUMENT', `Anchored file ${filePath} not in project`);
       if (!anchor.viewport || !['desktop', 'tablet', 'mobile'].includes(anchor.viewport.id) || !(anchor.viewport.width > 0) || !(anchor.viewport.height > 0)) {
         throw new DesignError('INVALID_ARGUMENT', 'Valid viewport is required on anchor');
+      }
+      if ((anchor.isolatedSlide !== undefined && typeof anchor.isolatedSlide !== 'boolean')
+        || (anchor.isolatedSlide && (!Number.isInteger(anchor.slideIndex) || anchor.slideIndex! < 0))) {
+        throw new DesignError('INVALID_ARGUMENT', 'A valid slide index is required for an isolated slide');
+      }
+      if (anchor.scroll !== undefined) {
+        if (!Number.isFinite(anchor.scroll?.x) || !Number.isFinite(anchor.scroll?.y)) {
+          throw new DesignError('INVALID_ARGUMENT', 'Valid scroll coordinates are required on anchor');
+        }
+        const { containers } = anchor.scroll;
+        if (containers !== undefined && (!Array.isArray(containers) || containers.length > MAX_COMMENT_SCROLL_CONTAINERS
+          || containers.some(item => typeof item?.selector !== 'string' || !item.selector.trim() || item.selector.length > 1000
+            || !Number.isFinite(item.x) || !Number.isFinite(item.y)))) {
+          throw new DesignError('INVALID_ARGUMENT', 'Valid scroll containers are required on anchor');
+        }
       }
       if (anchor.annotation) {
         try { validateReviewAnnotation(anchor.annotation); } catch (error) {
@@ -1255,6 +1325,195 @@ export class DesignProjects {
     });
   }
 
+  async renderCommentPreview(id: string, commentId: string): Promise<Buffer> {
+    return (await this.renderCommentPreviewDetails(id, commentId)).image;
+  }
+
+  async renderCommentPreviewDetails(id: string, commentId: string): Promise<CommentPreview> {
+    const pid = validateId(id);
+    const { comments } = await this.readCommentFile(pid);
+    const comment = comments.find(item => item.id === commentId);
+    const viewport = comment && commentPreviewViewport(comment.anchor);
+    if (!comment || !viewport || fileKind(comment.anchor.filePath) !== 'html') {
+      throw new DesignError('NOT_FOUND', 'Comment preview is unavailable');
+    }
+
+    const key = `${pid}:${comment.id}`;
+    const cached = this.commentPreviews.get(key);
+    if (cached) {
+      this.commentPreviews.delete(key);
+      this.commentPreviews.set(key, cached);
+      return cached;
+    }
+    const pending = this.pendingCommentPreviews.get(key);
+    if (pending) return pending;
+    if (this.pendingCommentPreviews.size >= MAX_PENDING_COMMENT_PREVIEWS) {
+      throw new DesignError('UNSUPPORTED', 'Comment preview renderer is busy', 503);
+    }
+
+    clearTimeout(this.commentPreviewIdleTimer);
+    const render = this.commentPreviewQueue.then(async () => {
+      const { versions } = await this.readVersionFile(pid);
+      const version = versions.findLast(item => computeRevision(item.files) === comment.sourceRevision);
+      const files = await this.snapshotMap(pid, version?.id).then(snapshot => snapshot.files);
+      if (!version) {
+        const manifest = Array.from(files, ([path, contents]) => ({ path, size: contents.length, sha256: sha256(contents) }));
+        if (computeRevision(manifest) !== comment.sourceRevision) {
+          throw new DesignError('NOT_FOUND', 'Comment preview version is unavailable');
+        }
+      }
+      if (!files.has(comment.anchor.filePath)) throw new DesignError('NOT_FOUND', 'Comment preview file is unavailable');
+
+      const target = deckCommentElement(comment.anchor);
+      let preview = await this.captureCommentPreview(files, comment.anchor, viewport, target?.element);
+      if (!preview && target) {
+        const candidate = await this.findCommentSnapshot(versions, comment, target.html);
+        if (candidate) {
+          const { files: savedFiles } = await this.snapshotMap(pid, candidate.id);
+          preview = await this.captureCommentPreview(savedFiles, comment.anchor, viewport, target.element);
+        }
+      }
+      if (!preview) throw new DesignError('NOT_FOUND', 'Comment target is unavailable in the saved slide');
+      this.commentPreviews.set(key, preview);
+      if (this.commentPreviews.size > MAX_COMMENT_PREVIEW_CACHE) {
+        const oldest = this.commentPreviews.keys().next().value;
+        if (oldest !== undefined) this.commentPreviews.delete(oldest);
+      }
+      return preview;
+    }).finally(() => {
+      this.pendingCommentPreviews.delete(key);
+      if (this.pendingCommentPreviews.size === 0 && this.commentPreviewBrowser) {
+        this.commentPreviewIdleTimer = setTimeout(() => {
+          const browser = this.commentPreviewBrowser;
+          this.commentPreviewBrowser = undefined;
+          void browser?.then(instance => instance.close()).catch(() => {});
+        }, 1000);
+        this.commentPreviewIdleTimer.unref();
+      }
+    });
+    this.pendingCommentPreviews.set(key, render);
+    this.commentPreviewQueue = render.then(() => {}, () => {});
+    return render;
+  }
+
+  private async findCommentSnapshot(versions: DesignVersion[], comment: DesignComment, html: string) {
+    // Older editor sessions could save an anchor from the visible frame against a different revision.
+    // Use a retained snapshot only when the captured markup identifies one distinct revision.
+    const matchingFiles = new Map<string, boolean>();
+    let match: { version: DesignVersion; revision: string } | undefined;
+    for (const version of versions) {
+      if (version.createdAt > comment.createdAt) continue;
+      const file = version.files.find(item => item.path === comment.anchor.filePath);
+      if (!file) continue;
+      if (!matchingFiles.has(file.sha256)) {
+        const body = await readFile(path.join(this.blobsDir, file.sha256), 'utf8').catch(() => '');
+        matchingFiles.set(file.sha256, body.replace(/\s+/g, ' ').includes(html));
+      }
+      if (!matchingFiles.get(file.sha256)) continue;
+      const revision = computeRevision(version.files);
+      if (revision === comment.sourceRevision) continue;
+      if (match && match.revision !== revision) return undefined;
+      match = { version, revision };
+    }
+    return match?.version;
+  }
+
+  private async captureCommentPreview(
+    files: Map<string, Buffer>,
+    anchor: DesignCommentAnchor,
+    { width, height, point }: NonNullable<ReturnType<typeof commentPreviewViewport>>,
+    element?: NonNullable<DesignCommentAnchor['element']>,
+  ): Promise<CommentPreview | null> {
+    const launching = this.commentPreviewBrowser ??= this.launchHeadless('comment-preview');
+    try {
+      const browser = await launching;
+      return await this.withSnapshotServer(files, async baseUrl => {
+        const context = await browser.createBrowserContext({ downloadBehavior: { policy: 'deny' } });
+        try {
+          const page = await context.newPage();
+          const pageUrl = `${baseUrl}/${anchor.filePath.split('/').map(encodeURIComponent).join('/')}`;
+          await page.setViewport({ width, height });
+          await page.setBypassServiceWorker(true);
+          await page.setRequestInterception(true);
+          let loadedEntry = false;
+          page.on('request', request => {
+            const url = request.url();
+            const navigation = request.isNavigationRequest();
+            const allowed = url.startsWith(`${baseUrl}/`)
+              && (!navigation || (!loadedEntry && request.frame() === page.mainFrame() && url === pageUrl));
+            if (allowed && navigation) loadedEntry = true;
+            void (allowed ? request.continue() : request.abort()).catch(() => {});
+          });
+          const response = await page.goto(pageUrl, { waitUntil: 'load', timeout: 5000 });
+          if (!response?.ok()) throw new DesignError('NOT_FOUND', 'Comment preview could not load');
+          if (anchor.isolatedSlide) {
+            const isolated = await page.evaluate(({ selector, attribute, css, index }) => {
+              const slides = Array.from(document.querySelectorAll(selector))
+                .filter(slide => !slide.parentElement?.closest(selector));
+              if (index === undefined || !slides[index]) return false;
+              const style = document.createElement('style');
+              style.textContent = css;
+              document.head.appendChild(style);
+              slides.forEach((slide, i) => slide.toggleAttribute(attribute, i !== index));
+              return true;
+            }, {
+              selector: DESIGN_DECK_SLIDE_SELECTOR, attribute: DESIGN_DECK_INACTIVE_ATTRIBUTE,
+              css: DESIGN_DECK_ISOLATION_CSS, index: anchor.slideIndex,
+            });
+            if (!isolated) return null;
+          } else if (Number.isInteger(anchor.slideIndex) && anchor.slideIndex! >= 0) {
+            await showSnapshotSlide(page, anchor.slideIndex!);
+          }
+          const origin = anchor.scroll ? await page.evaluate(async ({ x, y, containers }) => {
+            window.scrollTo({ left: x, top: y, behavior: 'instant' });
+            for (const point of containers ?? []) {
+              let elements: NodeListOf<Element>;
+              try { elements = document.querySelectorAll(point.selector); } catch { continue; }
+              if (elements.length === 1) elements[0].scrollTo({ left: point.x, top: point.y, behavior: 'instant' });
+            }
+            await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+            return { x: window.scrollX, y: window.scrollY };
+          }, anchor.scroll) : { x: 0, y: 0 };
+          if (element && !await page.evaluate(({ selector, tagName, text }) => {
+            let nodes: NodeListOf<Element>;
+            try { nodes = document.querySelectorAll(selector); } catch { return false; }
+            const normalize = (value: string) => value.replace(/\s+/g, ' ').trim().slice(0, 240);
+            const expected = normalize(text ?? '');
+            return Array.from(nodes).filter(node => {
+              if (node.tagName.toLowerCase() !== tagName.toLowerCase()) return false;
+              const box = node.getBoundingClientRect();
+              return box.width > 0 && box.height > 0 && box.right > 0 && box.bottom > 0
+                && box.left < innerWidth && box.top < innerHeight && getComputedStyle(node).visibility === 'visible'
+                && normalize((node as HTMLElement).innerText || node.textContent || '') === expected;
+            }).length === 1;
+          }, element)) return null;
+          let slideIndex = anchor.isolatedSlide ? anchor.slideIndex : undefined;
+          if (!anchor.isolatedSlide && Number.isInteger(anchor.slideIndex) && point) {
+            // Continuous deck previews could record a page counter that did not follow document scrolling.
+            slideIndex = await page.evaluate(({ x, y, selector }) => {
+              const target = document.elementFromPoint(x, y);
+              if (!target) return undefined;
+              const slides = Array.from(document.querySelectorAll(selector))
+                .filter(slide => !slide.parentElement?.closest(selector));
+              const index = slides.findIndex(slide => slide.contains(target));
+              return index >= 0 ? index : undefined;
+            }, { ...point, selector: DESIGN_DECK_SLIDE_SELECTOR });
+          }
+          const scale = Math.min(1, MAX_COMMENT_PREVIEW_DIMENSION / Math.max(width, height));
+          const image = Buffer.from(await page.screenshot({ type: 'png', clip: { ...origin, width, height, scale } }));
+          return { image, slideIndex };
+        } finally {
+          await context.close().catch(() => {});
+        }
+      }, { isolated: true });
+    } catch (error) {
+      const browser = await launching.catch(() => null);
+      if (!browser?.connected) this.commentPreviewBrowser = undefined;
+      if (error instanceof DesignError) throw error;
+      throw new DesignError('UNSUPPORTED', 'Comment preview could not be rendered');
+    }
+  }
+
   private async snapshotMap(id: string, versionId?: string | null): Promise<{ stored: StoredProject; files: Map<string, Buffer>; entry: string }> {
     const pid = validateId(id);
     const catalog = await this.readCatalog();
@@ -1310,26 +1569,55 @@ export class DesignProjects {
     return html;
   }
 
-  private async withSnapshotServer<T>(files: Map<string, Buffer>, fn: (baseUrl: string) => Promise<T>): Promise<T> {
+  private async withSnapshotServer<T>(files: Map<string, Buffer>, fn: (baseUrl: string) => Promise<T>, options?: { isolated?: boolean }): Promise<T> {
+    let origin: string;
     const server = http.createServer((req, res) => {
-      const u = new URL(req.url || '/', 'http://127.0.0.1');
-      const rel = decodeURIComponent(u.pathname).replace(/^\/+/, '');
+      let rel: string;
+      try {
+        const u = new URL(req.url || '/', origin);
+        rel = decodeURIComponent(u.pathname).replace(/^\/+/, '');
+      } catch { res.writeHead(400); res.end('Invalid path'); return; }
       const body = files.get(rel);
       if (!body) { res.writeHead(404); res.end('Not found'); return; }
-      res.writeHead(200, { 'Content-Type': mimeFor(rel), 'Cache-Control': 'no-store' });
+      const mime = mimeFor(rel);
+      const headers: Record<string, string> = { 'Content-Type': mime, 'Cache-Control': 'no-store' };
+      if (options?.isolated) {
+        headers['Access-Control-Allow-Origin'] = '*';
+        headers['X-Content-Type-Options'] = 'nosniff';
+        if (mime.startsWith('text/html')) {
+          headers['Content-Security-Policy'] = [
+            'sandbox allow-scripts',
+            "default-src 'none'",
+            `script-src ${origin} 'unsafe-inline'`,
+            `style-src ${origin} 'unsafe-inline'`,
+            `img-src ${origin} data: blob:`,
+            `font-src ${origin} data:`,
+            `media-src ${origin} data: blob:`,
+            `connect-src ${origin}`,
+            "form-action 'none'",
+            "base-uri 'none'",
+          ].join('; ');
+        }
+      }
+      res.writeHead(200, headers);
       res.end(body);
     });
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()));
     const addr = server.address() as { port: number };
-    try { return await fn(`http://127.0.0.1:${addr.port}`); } finally {
+    origin = `http://127.0.0.1:${addr.port}`;
+    try { return await fn(origin); } finally {
       await new Promise<void>(resolve => server.close(() => resolve()));
     }
   }
 
-  private async launchHeadless() {
+  private async launchHeadless(mode: 'export' | 'comment-preview' = 'export') {
     const executablePath = await browserExecutable();
     if (!executablePath) throw new DesignError('UNSUPPORTED', 'Chrome/Chromium executable not found for visual export');
     const puppeteer = (await import('puppeteer-core')).default;
+    if (mode === 'comment-preview') {
+      return puppeteer.launch({ executablePath, headless: true, pipe: true, protocolTimeout: 5000,
+        args: ['--force-webrtc-ip-handling-policy=disable_non_proxied_udp'] });
+    }
     return puppeteer.launch({ executablePath, headless: true, args: ['--no-sandbox', '--disable-gpu-sandbox'] });
   }
 
@@ -1405,12 +1693,7 @@ export class DesignProjects {
         pptx.title = stored.title;
 
         for (let i = 0; i < slideInfo.count; i++) {
-          await page.evaluate(index => {
-            window.postMessage({ type: 'od:slide', action: 'go', index }, '*');
-            const nodes = Array.from(document.querySelectorAll('.slide, [data-screen-label], .deck-slide, .ppt-slide, .slide-frame'));
-            if (nodes.length > 1) nodes.forEach((n, idx) => n.classList.toggle('active', idx === index));
-          }, i);
-          await new Promise(resolve => setTimeout(resolve, 120));
+          await showSnapshotSlide(page, i);
           const shot = Buffer.from(await page.screenshot({ type: 'png' }));
           const slide = pptx.addSlide();
           slide.addImage({ data: `data:image/png;base64,${shot.toString('base64')}`, x: 0, y: 0, w: '100%', h: '100%' });
@@ -1792,7 +2075,7 @@ export async function designHttp(
         const out = url.searchParams.get('thumb') === '1' && mime.startsWith('text/html')
           ? injectThumbPerfGuard(body)
           : mime.startsWith('text/html') && isValidPreviewBridgeToken(bridgeToken)
-            ? injectPreviewBridgeHtml(body, bridgeToken)
+            ? injectPreviewBridgeHtml(body, bridgeToken, true)
             : body;
         return sendPreviewResponse(out, mime, 'no-store');
       }
@@ -1886,6 +2169,22 @@ export async function designHttp(
         const body = await input(req, 256 * 1024);
         return sendJson(200, await service.createComment(id, { ...body, requestId: body?.requestId || randomUUID() }));
       }
+    }
+
+    const commentPreview = /^projects\/([^/]+)\/comments\/([^/]+)\/preview$/.exec(sub);
+    if (commentPreview && (req.method === 'GET' || req.method === 'HEAD')) {
+      const [, id, commentId] = commentPreview;
+      const { image, slideIndex } = await service.renderCommentPreviewDetails(id, commentId);
+      res.writeHead(200, {
+        'Content-Type': 'image/png',
+        'Content-Length': image.length,
+        ...(slideIndex !== undefined ? { 'X-OpenMotion-Slide-Index': String(slideIndex) } : {}),
+        'Cache-Control': 'private, max-age=3600',
+        'Cross-Origin-Resource-Policy': 'same-origin',
+        'X-Content-Type-Options': 'nosniff',
+      });
+      res.end(req.method === 'HEAD' ? undefined : image);
+      return true;
     }
 
     const commentItem = /^projects\/([^/]+)\/comments\/([^/]+)$/.exec(sub);
